@@ -1,0 +1,5 @@
+.DS_Store
+.ipynb_checkpoints/
+# Base sin comprimir (>100 MB, límite de GitHub). Se regenera con 01_merge_datos.ipynb; la versión .csv.gz sí se versiona
+datos-procesados/dengue_merge.csv
+datos-procesados/dengue_limpio.csv
