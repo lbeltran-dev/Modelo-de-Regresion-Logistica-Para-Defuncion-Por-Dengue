@@ -1,698 +1,902 @@
 """
-Genera la presentación del proyecto (Parte 1: merge y limpieza).
+Genera la presentación del proyecto (Parte 1: merge y limpieza) con formato sencillo:
+diseños estándar de PowerPoint (Título, Título y contenido, Dos contenidos, Comparación),
+fondo blanco y gráficas nativas. Todo se puede editar directamente en PowerPoint.
 
 Uso:  python presentacion/generar_presentacion.py
 Salida: presentacion/Presentacion_Dengue.pptx
 
-Para agregar secciones nuevas (EDA, modelo):
-  1. Escribe funciones de diapositiva como las de abajo (slide_* ).
-  2. Agrega una entrada en SECCIONES al final del archivo.
-Los helpers (titulo_contenido, tarjeta, stat, grafica_barras, etc.) mantienen el estilo.
+Para agregar secciones (EDA, modelo): escribe funciones slide_* como las de abajo
+y agrégalas a SECCIONES al final del archivo.
+
+Formato de las viñetas: cada elemento es un texto o (texto, nivel).
+El texto entre **dobles asteriscos** sale en negritas.
 """
 from pathlib import Path
+import base64
+import io
+import json
 import uuid
 
 from pptx import Presentation
-from pptx.util import Inches, Pt, Emu
-from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE
-from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+from pptx.util import Inches, Pt
 from pptx.chart.data import CategoryChartData
-from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_LEGEND_POSITION
 from pptx.oxml.ns import qn
 from lxml import etree
 
 SALIDA = Path(__file__).with_name("Presentacion_Dengue.pptx")
-
-# ───────────────────────── Paleta y tipografía ─────────────────────────
-INK = "13302B"      # verde selva profundo (fondos oscuros, títulos)
-INK_2 = "1D4A41"    # círculos decorativos sobre fondo oscuro
-PAPER = "FFFFFF"
-MIST = "EEF3F1"     # tinte para tarjetas
-LINE = "C9D3D0"
-TEXT = "1E2A28"
-MUTED = "5B6B67"
-TEAL = "2E8B7A"     # casos / conteos
-RED = "C8384E"      # muertes / mortalidad
-AMBER = "E0A030"    # categoría de referencia / acento
-AMBER_TXT = "9A6A10"
-LIGHT_ON_DARK = "B9CFC9"
-
-HEAD = "Cambria"
-BODY = "Calibri"
-
-W, H = 13.333, 7.5
-PIE = "Defunción por dengue · Proyecto AEM"
+RAIZ = Path(__file__).resolve().parent.parent
 
 
-def rgb(h):
-    return RGBColor.from_string(h)
+def imagen_notebook(notebook, texto_en_codigo):
+    """Regresa (como archivo en memoria) la primera imagen de la celda cuyo código contiene el texto."""
+    nb = json.loads((RAIZ / notebook).read_text(encoding="utf-8"))
+    for celda in nb["cells"]:
+        if celda["cell_type"] == "code" and texto_en_codigo in "".join(celda["source"]):
+            for salida in celda.get("outputs", []):
+                png = salida.get("data", {}).get("image/png")
+                if png:
+                    return io.BytesIO(base64.b64decode("".join(png) if isinstance(png, list) else png))
+    raise ValueError(f"No se encontró la imagen '{texto_en_codigo}' en {notebook}")
+
+# Diseños de la plantilla por defecto
+L_TITULO, L_CONTENIDO, L_SECCION, L_DOS, L_COMPARACION, L_SOLO_TITULO = 0, 1, 2, 3, 4, 5
+
+TAM_TITULO = 36
+TAM_TEXTO = 20
+TAM_SUB = 18
 
 
-# ───────────────────────── Helpers básicos ─────────────────────────
-def _sin_estilo(shape):
-    st = shape._element.find(qn("p:style"))
-    if st is not None:
-        shape._element.remove(st)
+# ───────────────────────── Helpers ─────────────────────────
+def a_16x9(prs):
+    """Cambia a 16:9 y ensancha los placeholders del patrón y los diseños."""
+    k = 13.333 / 10
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    for contenedor in [prs.slide_master] + list(prs.slide_layouts):
+        for sh in contenedor.shapes:
+            if sh._element.find(".//" + qn("a:xfrm")) is not None:
+                sh.left, sh.width = int(sh.left * k), int(sh.width * k)
 
 
-def fondo(slide, color):
-    f = slide.background.fill
-    f.solid()
-    f.fore_color.rgb = rgb(color)
+def _runs(p, texto, size):
+    for i, trozo in enumerate(texto.split("**")):
+        if not trozo:
+            continue
+        r = p.add_run()
+        r.text = trozo
+        r.font.size = Pt(size)
+        r.font.bold = i % 2 == 1
 
 
-def forma(slide, tipo, x, y, w, h, fill=None, line=None, radio=None, nombre=None):
-    s = slide.shapes.add_shape(tipo, Inches(x), Inches(y), Inches(w), Inches(h))
-    _sin_estilo(s)
-    if fill:
-        s.fill.solid()
-        s.fill.fore_color.rgb = rgb(fill)
-    else:
-        s.fill.background()
-    if line:
-        s.line.color.rgb = rgb(line)
-        s.line.width = Pt(1)
-    else:
-        s.line.fill.background()
-    if radio is not None:
-        s.adjustments[0] = radio
-    if nombre:
-        s.name = nombre
-    return s
-
-
-def tarjeta(slide, x, y, w, h, fill=MIST, line=None, nombre=None):
-    return forma(slide, MSO_SHAPE.ROUNDED_RECTANGLE, x, y, w, h, fill, line, radio=0.06, nombre=nombre)
-
-
-def _bullet(p, color, nivel_in=0.25):
-    pPr = p._p.get_or_add_pPr()
-    pPr.set("marL", str(Inches(nivel_in)))
-    pPr.set("indent", str(-Inches(nivel_in)))
-    buClr = etree.SubElement(pPr, qn("a:buClr"))
-    etree.SubElement(buClr, qn("a:srgbClr")).set("val", color)
-    etree.SubElement(pPr, qn("a:buFont")).set("typeface", "Arial")
-    etree.SubElement(pPr, qn("a:buChar")).set("char", "•")
-
-
-def texto(slide, x, y, w, h, parrafos, size=16, color=TEXT, bold=False, font=BODY,
-          align=PP_ALIGN.LEFT, anchor=MSO_ANCHOR.TOP, after=4, nombre=None):
-    """parrafos: str | lista de str/dict. dict: text|runs, size, color, bold, italic,
-    font, bullet, align, after. runs: lista de (texto, {opciones})."""
-    tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
-    if nombre:
-        tb.name = nombre
-    tf = tb.text_frame
-    tf.word_wrap = True
-    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
-    tf.vertical_anchor = anchor
-    if isinstance(parrafos, (str, dict)):
-        parrafos = [parrafos]
-    for i, item in enumerate(parrafos):
-        if isinstance(item, str):
-            item = {"text": item}
+def vinetas(ph, items, size=TAM_TEXTO, columnas=1):
+    tf = ph.text_frame
+    tf.clear()
+    for i, it in enumerate(items):
+        texto, nivel = (it, 0) if isinstance(it, str) else it
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-        p.alignment = item.get("align", align)
-        p.space_after = Pt(item.get("after", after))
-        runs = item.get("runs") or [(item.get("text", ""), {})]
-        for t, o in runs:
-            r = p.add_run()
-            r.text = t
-            f = r.font
-            f.name = o.get("font", item.get("font", font))
-            f.size = Pt(o.get("size", item.get("size", size)))
-            f.bold = o.get("bold", item.get("bold", bold))
-            f.italic = o.get("italic", item.get("italic", False))
-            f.color.rgb = rgb(o.get("color", item.get("color", color)))
-        if item.get("bullet"):
-            _bullet(p, item.get("bullet_color", TEAL))
-    return tb
+        p.level = nivel
+        p.space_after = Pt(6)
+        _runs(p, texto, size if nivel == 0 else TAM_SUB)
+    if columnas > 1:
+        tf._txBody.find(qn("a:bodyPr")).set("numCol", str(columnas))
 
 
-def circulo_num(slide, x, y, d, txt, fill=TEAL, color=PAPER, size=16):
-    c = forma(slide, MSO_SHAPE.OVAL, x, y, d, d, fill)
-    tf = c.text_frame
-    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER
-    r = p.add_run()
-    r.text = txt
-    r.font.size, r.font.bold, r.font.name = Pt(size), True, BODY
-    r.font.color.rgb = rgb(color)
-    return c
+def titulo(s, txt):
+    s.shapes.title.text = txt
+    for p in s.shapes.title.text_frame.paragraphs:
+        for r in p.runs:
+            r.font.size = Pt(TAM_TITULO)
 
 
-def stat(slide, x, y, w, numero, etiqueta, color=INK, size=40, label_color=MUTED, label_size=13):
-    texto(slide, x, y, w, size / 72 * 1.25, numero, size=size, bold=True, color=color, font=HEAD)
-    texto(slide, x, y + size / 72 * 1.3, w, 0.7, etiqueta, size=label_size, color=label_color)
+def ph(s, idx):
+    return s.placeholders[idx]
 
 
-def notas(slide, txt):
-    slide.notes_slide.notes_text_frame.text = txt
+def _quitar(s, idx):
+    """Quita el placeholder idx y regresa su posición (x, y, w, h)."""
+    lugar = ph(s, idx)
+    pos = lugar.left, lugar.top, lugar.width, lugar.height
+    lugar._element.getparent().remove(lugar._element)
+    return pos
 
 
-def pie(slide, prs, oscuro=False):
-    n = prs.slides.index(slide) + 1
-    c = LIGHT_ON_DARK if oscuro else MUTED
-    texto(slide, 0.6, 7.0, 8, 0.3, PIE, size=10, color=c)
-    texto(slide, W - 1.6, 7.0, 1.0, 0.3, str(n), size=10, color=c, align=PP_ALIGN.RIGHT)
+def a_tabla(s, filas, x, y, w, anchos=None, size=16, alto_fila=0.4):
+    """Tabla simple; la primera fila es el encabezado (en negritas)."""
+    tabla = s.shapes.add_table(len(filas), len(filas[0]), x, y, w, Inches(alto_fila * len(filas))).table
+    for fila in tabla.rows:
+        fila.height = Inches(alto_fila)
+    if anchos:
+        total = sum(anchos)
+        for c, a in enumerate(anchos):
+            tabla.columns[c].width = int(w * a / total)
+    for r, fila in enumerate(filas):
+        for c, valor in enumerate(fila):
+            cel = tabla.cell(r, c)
+            cel.text = str(valor)
+            for p in cel.text_frame.paragraphs:
+                for run in p.runs:
+                    run.font.size = Pt(size)
+                    run.font.bold = r == 0
+    return tabla
 
 
-def nueva(prs):
-    return prs.slides.add_slide(prs.slide_layouts[6])  # en blanco
-
-
-def titulo_contenido(prs, kicker, titulo):
-    """Diapositiva clara con etiqueta de sección + título (posición fija en todo el deck)."""
-    s = nueva(prs)
-    fondo(s, PAPER)
-    texto(s, 0.6, 0.42, 12, 0.3, kicker.upper(), size=12, bold=True, color=TEAL)
-    texto(s, 0.6, 0.72, 12.1, 0.8, titulo, size=30, bold=True, color=INK, font=HEAD,
-          anchor=MSO_ANCHOR.TOP, nombre="Título")
-    pie(s, prs)
-    return s
-
-
-def divisor(prs, numero, titulo, subtitulo):
-    s = nueva(prs)
-    fondo(s, INK)
-    forma(s, MSO_SHAPE.OVAL, 8.4, -1.6, 7.0, 7.0, INK_2)
-    forma(s, MSO_SHAPE.OVAL, 10.6, 4.6, 3.6, 3.6, INK_2)
-    texto(s, 0.9, 1.9, 4, 1.6, numero, size=96, bold=True, color=AMBER, font=HEAD)
-    texto(s, 0.9, 3.55, 8.5, 1.0, titulo, size=40, bold=True, color=PAPER, font=HEAD, nombre="Título")
-    texto(s, 0.9, 4.55, 8.0, 1.0, subtitulo, size=18, color=LIGHT_ON_DARK)
-    pie(s, prs, oscuro=True)
-    return s
-
-
-def grafica_barras(slide, x, y, w, h, categorias, valores, colores, formato="0.0%",
-                   horizontal=False, label_size=12, cat_size=12, gap=60, max_val=None):
+def a_grafica(s, idx, categorias, valores, formato="0.0%", horizontal=False, nombre="Serie"):
+    """Reemplaza el placeholder idx por una gráfica de barras nativa en la misma posición.
+    valores: lista (una serie) o dict {nombre_serie: lista} (varias series, con leyenda)."""
+    x, y, w, h = _quitar(s, idx)
     cd = CategoryChartData()
     cd.categories = categorias
-    cd.add_series("serie", valores)
+    series = valores if isinstance(valores, dict) else {nombre: valores}
+    for n, v in series.items():
+        cd.add_series(n, v)
     tipo = XL_CHART_TYPE.BAR_CLUSTERED if horizontal else XL_CHART_TYPE.COLUMN_CLUSTERED
-    ch = slide.shapes.add_chart(tipo, Inches(x), Inches(y), Inches(w), Inches(h), cd).chart
-    ch.has_legend = False
-    ch.has_title = False
-    ch.font.name = BODY
-    ch.font.size = Pt(cat_size)
-    ch.font.color.rgb = rgb(MUTED)
+    ch = s.shapes.add_chart(tipo, x, y, w, h, cd).chart
+    ch.has_legend = len(series) > 1
+    if ch.has_legend:
+        ch.legend.position = XL_LEGEND_POSITION.BOTTOM
+        ch.legend.include_in_layout = False
+    ch.font.size = Pt(14)
     plot = ch.plots[0]
-    plot.gap_width = gap
-    plot.vary_by_categories = False
     plot.has_data_labels = True
-    dl = plot.data_labels
-    dl.number_format = formato
-    dl.number_format_is_linked = False
-    dl.position = XL_LABEL_POSITION.OUTSIDE_END
-    dl.font.size = Pt(label_size)
-    dl.font.bold = True
-    dl.font.color.rgb = rgb(TEXT)
-    ser = plot.series[0]
-    for i, col in enumerate(colores if isinstance(colores, list) else [colores] * len(valores)):
-        pt = ser.points[i]
-        pt.format.fill.solid()
-        pt.format.fill.fore_color.rgb = rgb(col)
-    va = ch.value_axis
-    va.visible = False
-    va.has_major_gridlines = False
-    va.minimum_scale = 0
-    if max_val:
-        va.maximum_scale = max_val
-    ca = ch.category_axis
-    ca.format.line.color.rgb = rgb(LINE)
-    ca.tick_labels.font.size = Pt(cat_size)
-    ca.tick_labels.font.color.rgb = rgb(MUTED)
-    ca.has_major_gridlines = False
+    plot.data_labels.number_format = formato
+    plot.data_labels.number_format_is_linked = False
+    plot.data_labels.position = XL_LABEL_POSITION.OUTSIDE_END
+    ch.value_axis.visible = False
+    ch.value_axis.has_major_gridlines = False
     if horizontal:
-        ca.reverse_order = True
+        ch.category_axis.reverse_order = True
     return ch
+
+
+def a_grafica_lineas(s, idx, categorias, series, formato="#,##0", minimo=None):
+    """Reemplaza el placeholder idx por una gráfica de líneas con marcadores (varias series)."""
+    x, y, w, h = _quitar(s, idx)
+    cd = CategoryChartData()
+    cd.categories = categorias
+    for n, v in series.items():
+        cd.add_series(n, v)
+    ch = s.shapes.add_chart(XL_CHART_TYPE.LINE_MARKERS, x, y, w, h, cd).chart
+    ch.font.size = Pt(14)
+    ch.has_legend = True
+    ch.legend.position = XL_LEGEND_POSITION.BOTTOM
+    ch.legend.include_in_layout = False
+    va = ch.value_axis
+    va.tick_labels.number_format = formato
+    va.tick_labels.number_format_is_linked = False
+    if minimo is not None:
+        va.minimum_scale = minimo
+    return ch
+
+
+def imagen_en(s, img, x, y, w, h):
+    """Inserta una imagen dentro del recuadro (x, y, w, h), conservando proporción y centrada."""
+    pic = s.shapes.add_picture(img, x, y, width=w)
+    if pic.height > h:
+        pic.width = int(pic.width * h / pic.height)
+        pic.height = h
+    pic.left = x + (w - pic.width) // 2
+    return pic
+
+
+def imagen_y_texto(prs, txt_titulo, notebook, clave, items, notas=None, ancho=10, size=16):
+    """Imagen del notebook arriba (centrada) y viñetas debajo."""
+    s = nueva(prs, L_CONTENIDO, txt_titulo, notas)
+    pic = s.shapes.add_picture(imagen_notebook(notebook, clave), 0, Inches(1.5), width=Inches(ancho))
+    pic.left = (prs.slide_width - pic.width) // 2
+    cuerpo = ph(s, 1)
+    cuerpo.top = pic.top + pic.height + Inches(0.2)
+    cuerpo.height = Inches(7.1) - cuerpo.top
+    vinetas(cuerpo, items, size)
+    return s
+
+
+def nueva(prs, layout, txt_titulo, notas=None):
+    s = prs.slides.add_slide(prs.slide_layouts[layout])
+    titulo(s, txt_titulo)
+    if notas:
+        s.notes_slide.notes_text_frame.text = notas
+    return s
+
+
+def contenido(prs, txt_titulo, items, notas=None, size=TAM_TEXTO, columnas=1):
+    s = nueva(prs, L_CONTENIDO, txt_titulo, notas)
+    vinetas(ph(s, 1), items, size, columnas)
+    return s
+
+
+def seccion(prs, txt_titulo, subtitulo, notas=None):
+    s = nueva(prs, L_SECCION, txt_titulo, notas)
+    ph(s, 1).text = subtitulo
+    return s
+
+
+def texto_y_grafica(prs, txt_titulo, items, categorias, valores, formato, notas=None,
+                    grafica_izq=False, horizontal=False, size=TAM_TEXTO):
+    s = nueva(prs, L_DOS, txt_titulo, notas)
+    txt_idx, graf_idx = (2, 1) if grafica_izq else (1, 2)
+    vinetas(ph(s, txt_idx), items, size)
+    a_grafica(s, graf_idx, categorias, valores, formato, horizontal)
+    return s
+
+
+def comparacion(prs, txt_titulo, enc_izq, items_izq, enc_der, items_der, notas=None,
+                size=TAM_TEXTO, columnas=1):
+    s = nueva(prs, L_COMPARACION, txt_titulo, notas)
+    ph(s, 1).text = enc_izq
+    vinetas(ph(s, 2), items_izq, size, columnas)
+    ph(s, 3).text = enc_der
+    vinetas(ph(s, 4), items_der, size, columnas)
+    return s
 
 
 # ───────────────────────── Introducción ─────────────────────────
 def slide_portada(prs):
-    s = nueva(prs)
-    fondo(s, INK)
-    forma(s, MSO_SHAPE.OVAL, 8.9, -2.2, 6.8, 6.8, INK_2)
-    texto(s, 0.9, 1.0, 7.5, 0.4, "PROYECTO FINAL · ANÁLISIS ESTADÍSTICO MULTIVARIADO · ITESO",
-          size=12, bold=True, color=AMBER)
-    texto(s, 0.9, 1.6, 7.6, 2.4, "Factores asociados a la defunción por dengue en México",
-          size=44, bold=True, color=PAPER, font=HEAD, nombre="Título")
-    texto(s, 0.9, 4.1, 7.2, 0.9,
-          "Regresión logística binaria con datos abiertos de la DGE (SINAVE), 2020–2026",
-          size=18, color=LIGHT_ON_DARK)
-    texto(s, 0.9, 5.7, 7.2, 0.4, "Parte 1 · Construcción y limpieza de la base", size=16,
-          bold=True, color=PAPER)
-
-    for i, (num, lab) in enumerate([("294", "fotos semanales de datos abiertos"),
-                                     ("1,276,897", "registros únicos tras el merge"),
-                                     ("251,900", "casos confirmados para el modelo")]):
-        y = 2.0 + i * 1.45
-        texto(s, 9.3, y, 3.6, 0.75, num, size=40, bold=True, color=AMBER if i == 2 else PAPER, font=HEAD)
-        texto(s, 9.3, y + 0.75, 3.6, 0.4, lab, size=13, color=LIGHT_ON_DARK)
-    notas(s, "Presentamos el proyecto final: un modelo de regresión logística para identificar "
-             "qué factores se asocian a la muerte en pacientes con dengue confirmado en México. "
-             "Esta primera parte explica cómo construimos y limpiamos la base de datos.")
+    s = nueva(prs, L_TITULO, "Factores asociados a la defunción por dengue en México",
+              "Proyecto final: modelo de regresión logística para identificar qué factores se asocian "
+              "a la muerte en pacientes con dengue confirmado. Esta primera parte explica cómo "
+              "construimos y limpiamos la base de datos.")
+    ph(s, 1).text = ("Regresión logística binaria con datos abiertos de la DGE (SINAVE), 2020–2026\n"
+                     "Análisis Estadístico Multivariado · ITESO\n"
+                     "Construcción de la base, análisis exploratorio y modelo")
 
 
 def slide_ruta(prs):
-    s = titulo_contenido(prs, "Ruta del proyecto", "El proyecto avanza en cuatro etapas")
-    etapas = [
-        ("01", "Merge de datos", "Unir 294 fotos semanales en una sola base con un registro por paciente.", True),
-        ("02", "Limpieza", "Filtrar casos confirmados, seleccionar variables y recodificar a 1/0.", True),
-        ("03", "Análisis exploratorio", "Describir la mortalidad según cada variable.", False),
-        ("04", "Modelo", "Estimar la regresión logística e interpretar los coeficientes.", False),
-    ]
-    cw, gap, x0, y0, ch = 2.75, 0.35, 0.64, 1.95, 3.9
-    for i, (n, t, d, hecho) in enumerate(etapas):
-        x = x0 + i * (cw + gap)
-        tarjeta(s, x, y0, cw, ch, fill=MIST if hecho else PAPER, line=None if hecho else LINE,
-                nombre=f"Etapa {n}")
-        circulo_num(s, x + 0.3, y0 + 0.35, 0.8, n, fill=TEAL if hecho else LINE,
-                    color=PAPER if hecho else MUTED, size=20)
-        texto(s, x + 0.3, y0 + 1.4, cw - 0.6, 0.5, t, size=20, bold=True, color=INK, font=HEAD)
-        texto(s, x + 0.3, y0 + 1.95, cw - 0.6, 1.2, d, size=14, color=TEXT)
-        chip = forma(s, MSO_SHAPE.ROUNDED_RECTANGLE, x + 0.3, y0 + ch - 0.7, 1.55, 0.36,
-                     fill=TEAL if hecho else MIST, radio=0.5)
-        tf = chip.text_frame
-        tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
-        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-        p = tf.paragraphs[0]
-        p.alignment = PP_ALIGN.CENTER
-        r = p.add_run()
-        r.text = "Completado" if hecho else "Próximamente"
-        r.font.size, r.font.bold, r.font.name = Pt(12), True, BODY
-        r.font.color.rgb = rgb(PAPER if hecho else MUTED)
-    texto(s, 0.64, 6.2, 12, 0.4,
-          "Esta presentación cubre las etapas 01 y 02. Las etapas 03 y 04 se agregarán después.",
-          size=14, color=MUTED)
-    notas(s, "El trabajo está dividido en cuatro notebooks. Hoy cubrimos los dos primeros: "
-             "cómo unimos los archivos de datos abiertos y cómo limpiamos la base para el modelo.")
+    contenido(prs, "Ruta del proyecto", [
+        "**01 · Merge de datos:** unir 294 fotos semanales en una base con un registro por paciente (completado)",
+        "**02 · Limpieza:** filtrar casos confirmados, seleccionar variables y recodificar a 1/0 (completado)",
+        "**03 · Análisis exploratorio:** describir la mortalidad según cada variable (completado)",
+        "**04 · Modelo:** estimar la regresión logística e interpretar los coeficientes (completado)",
+    ], "El trabajo está dividido en cuatro notebooks.")
 
 
 def slide_pregunta(prs):
-    s = titulo_contenido(prs, "Planteamiento", "¿Qué factores se asocian a morir por dengue?")
-    tarjeta(s, 0.6, 1.8, 4.1, 4.7, fill=INK, nombre="Variable objetivo")
-    texto(s, 0.95, 2.15, 3.4, 0.3, "VARIABLE OBJETIVO", size=12, bold=True, color=AMBER)
-    texto(s, 0.95, 2.55, 3.4, 0.7, "DEFUNCION", size=32, bold=True, color=PAPER, font=HEAD)
-    texto(s, 0.95, 3.4, 3.4, 1.0, ["1 = el paciente murió", "0 = no murió"], size=16, color=PAPER)
-    texto(s, 0.95, 4.6, 3.4, 1.6,
-          "Población: casos confirmados de dengue en México con inicio de síntomas entre 2020 y 2026.",
-          size=14, color=LIGHT_ON_DARK)
-
-    grupos = [
-        ("Demográficas", "Sexo · Edad · Indígena"),
-        ("Comorbilidades", "Diabetes · Hipertensión · Enfermedad renal · Inmunosupresión · Cirrosis hepática · Embarazo"),
-        ("Gravedad clínica", "Manifestaciones hemorrágicas · Tipo de paciente (hospitalizado)"),
-        ("Laboratorio", "Resultado de PCR (serotipo del virus)"),
-        ("Tiempo y lugar", "Mes de inicio de síntomas · Entidad de asignación (costera o no)"),
-    ]
-    texto(s, 5.1, 1.8, 7.6, 0.35, "VARIABLES INDEPENDIENTES", size=12, bold=True, color=TEAL)
-    for i, (g, v) in enumerate(grupos):
-        y = 2.25 + i * 0.86
-        tarjeta(s, 5.1, y, 7.6, 0.74, fill=MIST)
-        texto(s, 5.35, y, 2.2, 0.74, g, size=15, bold=True, color=INK, anchor=MSO_ANCHOR.MIDDLE)
-        texto(s, 7.55, y, 5.0, 0.74, v, size=14, color=TEXT, anchor=MSO_ANCHOR.MIDDLE)
-    notas(s, "La variable de respuesta es binaria: si el paciente murió o no. Las variables "
-             "independientes se eligieron al inicio del proyecto (archivo VARIABLES.rtf) y se "
-             "agrupan en demográficas, comorbilidades, gravedad, laboratorio y tiempo/lugar.")
+    contenido(prs, "¿Qué factores se asocian a morir por dengue?", [
+        "**Variable objetivo:** DEFUNCION (1 = murió, 0 = no murió)",
+        "**Población:** casos confirmados de dengue en México, inicio de síntomas 2020–2026",
+        "**Variables independientes:**",
+        ("Demográficas: sexo, edad, indígena", 1),
+        ("Comorbilidades: diabetes, hipertensión, enfermedad renal, inmunosupresión, cirrosis hepática, embarazo", 1),
+        ("Gravedad clínica: manifestaciones hemorrágicas, tipo de paciente (hospitalizado)", 1),
+        ("Laboratorio: resultado de PCR (serotipo)", 1),
+        ("Tiempo y lugar: mes de inicio de síntomas, entidad de asignación (costera o no)", 1),
+    ], "Las variables se eligieron al inicio del proyecto (archivo VARIABLES.rtf).")
 
 
 # ───────────────────────── 01 · Merge ─────────────────────────
 def slide_div_merge(prs):
-    s = divisor(prs, "01", "Merge de datos", "De 294 fotos semanales a una base con un registro por paciente")
-    notas(s, "Primera etapa: notebook 01_merge_datos.ipynb.")
+    seccion(prs, "01 · Merge de datos", "De 294 fotos semanales a una base con un registro por paciente",
+            "Primera etapa: notebook 01_merge_datos.ipynb.")
 
 
 def slide_fuente(prs):
-    s = titulo_contenido(prs, "01 · Merge de datos", "Los datos llegan como 294 fotos semanales acumuladas")
-    texto(s, 0.6, 1.9, 5.6, 4.4, [
-        {"runs": [("Fuente: ", {"bold": True}), ("Datos Abiertos de la DGE, bases históricas de "
-                  "enfermedades transmitidas por vector (dic-2020 a nov-2026).", {})], "bullet": True, "after": 14},
-        {"runs": [("Cada archivo es acumulado: ", {"bold": True}), ("trae todos los casos del año "
-                  "hasta esa fecha, no solo los de esa semana.", {})], "bullet": True, "after": 14},
-        {"runs": [("Los registros se corrigen ", {"bold": True}), ("de una foto a otra: cambian "
-                  "ESTATUS_CASO, DEFUNCION, etc.", {})], "bullet": True, "after": 14},
-        {"runs": [("Mismo formato: ", {"bold": True}), ("las 294 fotos tienen las mismas 28 columnas.", {})],
-         "bullet": True},
-    ], size=16)
-    texto(s, 6.8, 1.9, 5.9, 0.35, "Archivos por año", size=14, bold=True, color=INK)
-    grafica_barras(s, 6.7, 2.3, 6.0, 4.1, ["2020", "2021", "2022", "2023", "2024", "2025", "2026"],
-                   [4, 50, 53, 51, 50, 48, 38], TEAL, formato="0", label_size=13, cat_size=13)
-    texto(s, 6.8, 6.45, 5.9, 0.3, "2020 solo incluye diciembre; 2026 llega hasta el 5 de noviembre.",
-          size=11, color=MUTED)
-    notas(s, "Lo importante es que cada zip es una foto acumulada del año: el mismo paciente aparece "
-             "en muchas fotos, y su información puede cambiar entre ellas. Por eso no basta con "
-             "concatenar los archivos.")
+    texto_y_grafica(prs, "Fuente de los datos", [
+        "**Datos Abiertos de la DGE:** bases históricas de enfermedades transmitidas por vector (dic-2020 a nov-2026)",
+        "Cada archivo es una **foto acumulada** del año: trae todos los casos hasta esa fecha",
+        "Los registros **se corrigen** de una foto a otra (ESTATUS_CASO, DEFUNCION, etc.)",
+        "Las 294 fotos tienen las mismas 28 columnas",
+    ], ["2020", "2021", "2022", "2023", "2024", "2025", "2026"], [4, 50, 53, 51, 50, 48, 38], "0",
+        "Gráfica: número de archivos por año. 2020 solo incluye diciembre; 2026 llega al 5 de noviembre. "
+        "Como cada foto es acumulada, el mismo paciente aparece muchas veces y no basta con concatenar.",
+        size=18)
 
 
 def slide_estrategia(prs):
-    s = titulo_contenido(prs, "01 · Merge de datos", "El merge conserva la versión más reciente de cada registro")
-    pasos = [
-        ("1", "Ordenar", "Las fotos se leen en orden cronológico según la fecha del nombre del archivo."),
-        ("2", "Leer", "Solo el CSV válido de cada zip; todo como texto para no perder información."),
-        ("3", "Deduplicar", "Concatenar foto por foto y quedarse con la última versión de cada ID_REGISTRO."),
-        ("4", "Bitácora", "Guardar en qué fotos aparece cada registro y qué valor de DEFUNCION tenía."),
-    ]
-    cw, gap = 2.8, 0.3
-    for i, (n, t, d) in enumerate(pasos):
-        x = 0.6 + i * (cw + gap)
-        tarjeta(s, x, 1.85, cw, 2.45, fill=MIST)
-        circulo_num(s, x + 0.25, 2.1, 0.6, n, size=16)
-        texto(s, x + 1.0, 2.1, cw - 1.2, 0.6, t, size=18, bold=True, color=INK, font=HEAD,
-              anchor=MSO_ANCHOR.MIDDLE)
-        texto(s, x + 0.25, 2.9, cw - 0.5, 1.3, d, size=14, color=TEXT)
-    stat(s, 0.6, 4.75, 3.8, "19,876,426", "filas leídas en total", color=MUTED, size=36)
-    texto(s, 4.3, 4.85, 0.8, 0.7, "→", size=40, color=TEAL, bold=True, align=PP_ALIGN.CENTER)
-    stat(s, 5.1, 4.75, 3.8, "1,276,897", "registros únicos (ID_REGISTRO)", color=TEAL, size=36)
-    texto(s, 9.3, 4.8, 3.4, 1.4,
-          "Se hace foto por foto porque unir ~20 millones de filas de una vez satura la memoria. "
-          "Es el mismo criterio que el repositorio DengueMX.", size=13, color=MUTED)
-    notas(s, "El algoritmo acumula foto por foto y en cada paso elimina duplicados conservando el "
-             "último. Así, de casi 20 millones de filas leídas quedan 1.28 millones de registros únicos. "
-             "También detectamos 148 IDs repetidos dentro de una misma foto.")
+    contenido(prs, "Estrategia del merge", [
+        "**1. Ordenar** las fotos cronológicamente según la fecha del nombre del archivo",
+        "**2. Leer** solo el CSV válido de cada zip, todo como texto para no perder información",
+        "**3. Deduplicar:** concatenar foto por foto y quedarse con la última versión de cada ID_REGISTRO",
+        "**4. Bitácora:** guardar en qué fotos aparece cada registro y su valor de DEFUNCION",
+        "**Resultado:** 19,876,426 filas leídas → 1,276,897 registros únicos",
+        ("Se hace foto por foto porque unir ~20 millones de filas de una vez satura la memoria", 1),
+        ("Mismo criterio que el repositorio DengueMX; 148 IDs repetidos dentro de una misma foto", 1),
+    ])
 
 
 def slide_trazabilidad(prs):
-    s = titulo_contenido(prs, "01 · Merge de datos", "Cada registro guarda su historial para decidir en la limpieza")
-    items = [
-        ("N_FOTOS", "En cuántas fotos semanales apareció el registro.", None, None),
-        ("PRIMERA_FOTO / ULTIMA_FOTO", "Fecha de la primera y la última foto donde aparece.", None, None),
-        ("DEFUNCION_CAMBIO", "Indica si DEFUNCION cambió en algún momento (por ejemplo, de No a Sí).",
-         "2,494", "registros cambiaron"),
-        ("EN_FOTO_FINAL", "Indica si el registro sigue en la última foto de su año. Si no, la DGE lo dio de baja.",
-         "22,629", "registros dados de baja"),
-    ]
-    cw, chh = 5.9, 2.15
-    for i, (t, d, num, lab) in enumerate(items):
-        x = 0.6 + (i % 2) * (cw + 0.3)
-        y = 1.85 + (i // 2) * (chh + 0.3)
-        tarjeta(s, x, y, cw, chh, fill=MIST)
-        tw = 3.4 if num else cw - 0.6
-        texto(s, x + 0.3, y + 0.3, tw, 0.4, t, size=16, bold=True, color=INK)
-        texto(s, x + 0.3, y + 0.8, tw, 1.2, d, size=14, color=TEXT)
-        if num:
-            texto(s, x + 3.9, y + 0.45, 1.8, 0.7, num, size=32, bold=True, color=RED if i == 2 else TEAL,
-                  font=HEAD, align=PP_ALIGN.RIGHT)
-            texto(s, x + 3.7, y + 1.2, 2.0, 0.6, lab, size=12, color=MUTED, align=PP_ALIGN.RIGHT)
-    notas(s, "Además de la base, el merge genera columnas de trazabilidad. Las dos más importantes "
-             "son DEFUNCION_CAMBIO y EN_FOTO_FINAL, porque con ellas decidimos qué registros quitar "
-             "en la limpieza.")
+    contenido(prs, "Metadatos de trazabilidad", [
+        "**N_FOTOS:** en cuántas fotos semanales apareció el registro",
+        "**PRIMERA_FOTO / ULTIMA_FOTO:** fecha de la primera y la última foto donde aparece",
+        "**DEFUNCION_CAMBIO:** si DEFUNCION cambió en algún momento (2,494 registros)",
+        "**EN_FOTO_FINAL:** si el registro sigue en la última foto de su año (22,629 dados de baja)",
+    ], "DEFUNCION_CAMBIO y EN_FOTO_FINAL se usan en la limpieza para decidir qué registros quitar.")
 
 
 def slide_resultado_merge(prs):
-    s = titulo_contenido(prs, "01 · Merge de datos", "La base unificada cubre síntomas de 2020 a 2026")
-    texto(s, 0.6, 1.9, 5.2, 0.35, "Normalización de tipos", size=14, bold=True, color=INK)
-    texto(s, 0.6, 2.35, 5.2, 2.6, [
-        {"text": "Fechas en dos formatos (AAAA-MM-DD y DD/MM/AAAA) se unifican.", "bullet": True, "after": 10},
-        {"text": "9999-99-99 significa \"sin registro\" y se vuelve fecha vacía.", "bullet": True, "after": 10},
-        {"text": "Las claves de catálogo pasan a enteros; todavía no se recodifica nada.", "bullet": True, "after": 10},
-        {"text": "Se agrega ANIO_SINTOMAS a partir de la fecha de síntomas.", "bullet": True},
-    ], size=15)
-    tarjeta(s, 0.6, 5.0, 5.2, 1.5, fill=MIST)
-    stat(s, 0.9, 5.15, 2.4, "36", "columnas finales", color=TEAL, size=30)
-    stat(s, 2.9, 5.15, 2.8, "15.4 MB", "comprimido (.csv.gz) para GitHub", color=TEAL, size=30)
-    texto(s, 6.5, 1.9, 6.2, 0.35, "Registros por año de inicio de síntomas", size=14, bold=True, color=INK)
-    grafica_barras(s, 6.4, 2.3, 6.3, 4.2, ["2020", "2021", "2022", "2023", "2024", "2025", "2026"],
-                   [120671, 37395, 61123, 281916, 555685, 146444, 73663], TEAL, formato="#,##0",
-                   label_size=12, cat_size=13)
-    notas(s, "Al final del merge tenemos 1,276,897 registros con 36 columnas: las 28 originales, "
-             "el año de síntomas y las columnas de trazabilidad. 2024 fue el año con más registros. "
-             "Ojo: aquí todavía hay casos probables y descartados, no solo confirmados.")
+    texto_y_grafica(prs, "Resultado del merge", [
+        "Fechas en dos formatos se unifican; 9999-99-99 se vuelve fecha vacía",
+        "Las claves de catálogo pasan a enteros (sin recodificar)",
+        "Se agrega ANIO_SINTOMAS",
+        "**1,276,897 registros × 36 columnas**",
+        "dengue_merge.csv.gz: 15.4 MB",
+    ], ["2020", "2021", "2022", "2023", "2024", "2025", "2026"],
+        [120671, 37395, 61123, 281916, 555685, 146444, 73663], "#,##0",
+        "Gráfica: registros por año de inicio de síntomas. Aquí todavía hay casos probables y descartados.",
+        size=18)
 
 
 # ───────────────────────── 02 · Limpieza ─────────────────────────
 def slide_div_limpieza(prs):
-    s = divisor(prs, "02", "Limpieza", "De 1.28 millones de registros a 251,900 casos confirmados listos para modelar")
-    notas(s, "Segunda etapa: notebook 02_limpieza.ipynb.")
+    seccion(prs, "02 · Limpieza", "De 1.28 millones de registros a 251,900 casos confirmados",
+            "Segunda etapa: notebook 02_limpieza.ipynb.")
 
 
 def slide_embudo(prs):
-    s = titulo_contenido(prs, "02 · Limpieza", "Tres filtros dejan 251,900 casos confirmados")
+    s = nueva(prs, L_SOLO_TITULO, "Filtros de la limpieza",
+              "El filtro más fuerte es quedarse solo con confirmados: casi todo lo que se quita son "
+              "casos probables (719,278) y descartados (283,089).")
     filas = [
-        ("Base del merge", None, 1276897, 5296),
-        ("1 · Sigue en la foto final", "quita 22,629 (1.77%)", 1254268, 5207),
-        ("2 · Solo confirmados", "quita 1,002,367 (79.92%)", 251901, 1763),
-        ("3 · Entidad especificada", "quita 1 registro", 251900, 1763),
+        ("Paso", "Se quitan", "Quedan", "Muertes"),
+        ("0 · Base del merge", "–", "1,276,897", "5,296"),
+        ("1 · Sigue en la foto final", "22,629 (1.77%)", "1,254,268", "5,207"),
+        ("2 · Solo confirmados (ESTATUS_CASO = 2)", "1,002,367 (79.92%)", "251,901", "1,763"),
+        ("3 · Entidad de asignación especificada", "1", "251,900", "1,763"),
+        ("Total", "1,024,997 (80.27%)", "251,900", "1,763 (0.70%)"),
     ]
-    texto(s, 4.05, 1.8, 3, 0.3, "Registros", size=12, bold=True, color=MUTED)
-    texto(s, 10.75, 1.8, 1.95, 0.3, "Muertes", size=12, bold=True, color=MUTED, align=PP_ALIGN.RIGHT)
-    maxw = 6.0
-    for i, (lab, q, n, m) in enumerate(filas):
-        y = 2.2 + i * 1.0
-        texto(s, 0.6, y, 3.3, 0.45, lab, size=15, bold=True, color=INK)
-        if q:
-            texto(s, 0.6, y + 0.42, 3.3, 0.35, q, size=12, color=MUTED)
-        bw = max(maxw * n / 1276897, 0.05)
-        final = i == len(filas) - 1
-        forma(s, MSO_SHAPE.RECTANGLE, 4.05, y + 0.05, bw, 0.6, TEAL if final else "9CC7BD")
-        texto(s, 4.05 + bw + 0.15, y + 0.05, 2.2, 0.6, f"{n:,}", size=16, bold=True,
-              color=TEAL if final else TEXT, anchor=MSO_ANCHOR.MIDDLE)
-        texto(s, 10.75, y + 0.05, 1.95, 0.6, f"{m:,}", size=16, bold=True, color=RED,
-              anchor=MSO_ANCHOR.MIDDLE, align=PP_ALIGN.RIGHT)
-    tarjeta(s, 0.6, 6.25, 12.1, 0.6, fill=MIST)
-    texto(s, 0.85, 6.25, 11.6, 0.6,
-          [{"runs": [("En total se quita el 80.27% de la base. ", {"bold": True}),
-                     ("Casi todo corresponde a casos probables (719,278) y descartados (283,089). "
-                      "Mortalidad final: 0.70%.", {})]}],
-          size=14, color=TEXT, anchor=MSO_ANCHOR.MIDDLE)
-    notas(s, "Paso 1: quitamos registros que la DGE dio de baja (no están en la foto final de su año). "
-             "Paso 2: el filtro más fuerte; nos quedamos solo con ESTATUS_CASO = 2 (confirmado). "
-             "Paso 3: un solo registro con entidad de asignación 99 (no especificada). "
-             "Quedan 251,900 casos con 1,763 muertes.")
+    tabla = s.shapes.add_table(len(filas), 4, Inches(0.67), Inches(1.9), Inches(12), Inches(3.6)).table
+    for c, w in enumerate([5.4, 2.6, 2.0, 2.0]):
+        tabla.columns[c].width = Inches(w)
+    for r, fila in enumerate(filas):
+        for c, valor in enumerate(fila):
+            cel = tabla.cell(r, c)
+            cel.text = valor
+            for p in cel.text_frame.paragraphs:
+                for run in p.runs:
+                    run.font.size = Pt(18)
+                    run.font.bold = r in (0, len(filas) - 1)
 
 
 def slide_decision(prs):
-    s = titulo_contenido(prs, "02 · Limpieza · Decisión del equipo",
-                         "Conservamos los cambios en DEFUNCION para no sesgar el modelo")
-    texto(s, 0.6, 1.85, 12.1, 0.8,
-          [{"runs": [("2,494 registros cambiaron su valor de DEFUNCION. ", {"bold": True}),
-                     ("De ellos, 2,433 pasaron de \"No\" a \"Sí\": la muerte se registró después. "
-                      "Su valor final es el correcto.", {})]}], size=16)
-    # Opción elegida
-    tarjeta(s, 0.6, 2.85, 5.9, 3.0, fill=MIST, nombre="Opción elegida")
-    texto(s, 0.9, 3.1, 5.3, 0.3, "OPCIÓN ELEGIDA · SE CONSERVAN", size=12, bold=True, color=TEAL)
-    stat(s, 0.9, 3.5, 2.6, "251,900", "casos confirmados", color=INK, size=34)
-    stat(s, 3.6, 3.5, 2.6, "1,763", "muertes (0.70%)", color=RED, size=34)
-    texto(s, 0.9, 4.85, 5.3, 0.9, "El modelo ve todas las muertes, se hayan reportado rápido o tarde.",
-          size=14, color=TEXT)
-    # Alternativa
-    tarjeta(s, 6.8, 2.85, 5.9, 3.0, fill=PAPER, line=LINE, nombre="Alternativa")
-    texto(s, 7.1, 3.1, 5.3, 0.3, "ALTERNATIVA DESCARTADA · QUITARLOS", size=12, bold=True, color=MUTED)
-    stat(s, 7.1, 3.5, 2.6, "251,077", "casos confirmados", color=MUTED, size=34)
-    stat(s, 9.8, 3.5, 2.6, "962", "muertes", color=MUTED, size=34)
-    texto(s, 7.1, 4.85, 5.3, 0.9, "Se perderían 801 de 1,770 muertes confirmadas (45%).",
-          size=14, color=TEXT)
-    texto(s, 0.6, 6.15, 12.1, 0.6,
-          [{"runs": [("Riesgo evitado: ", {"bold": True, "color": RED}),
-                     ("sesgo de selección; el modelo solo aprendería de las muertes que se reportaron rápido.", {})]}],
-          size=15)
-    notas(s, "Esta fue la decisión más importante de la limpieza. Si quitábamos los registros cuyo "
-             "valor de DEFUNCION cambió, perdíamos casi la mitad de las muertes, y justamente las que "
-             "se registraron tarde. Por eso solo filtramos por foto final y conservamos el valor más reciente.")
+    comparacion(prs, "Decisión: se conservan los cambios en DEFUNCION",
+                "Opción elegida: conservarlos", [
+                    "251,900 casos confirmados",
+                    "1,763 muertes (0.70%)",
+                    "El modelo ve todas las muertes, reportadas rápido o tarde",
+                ],
+                "Alternativa descartada: quitarlos", [
+                    "251,077 casos confirmados",
+                    "962 muertes",
+                    "Se pierden 801 de 1,770 muertes confirmadas (45%) → sesgo de selección",
+                ],
+                "2,494 registros cambiaron DEFUNCION; 2,433 pasaron de No a Sí porque la muerte se "
+                "registró después. Su valor final es el correcto. Por eso solo filtramos por foto final.")
 
 
 def slide_variables(prs):
-    s = titulo_contenido(prs, "02 · Limpieza", "Seleccionamos 17 de las 35 columnas")
-    conservan = ["ID_REGISTRO", "DEFUNCION", "SEXO", "EDAD_ANOS", "FECHA_SIGN_SINTOMAS",
+    comparacion(prs, "Selección de variables: 17 de 35 columnas",
+                "Se conservan (17)",
+                ["ID_REGISTRO", "DEFUNCION", "SEXO", "EDAD_ANOS", "FECHA_SIGN_SINTOMAS",
                  "ANIO_SINTOMAS", "ENTIDAD_ASIG", "INDIGENA", "HEMORRAGICOS",
                  "DIABETES", "HIPERTENSION", "ENFERMEDAD_RENAL", "INMUNOSUPR",
-                 "CIRROSIS_HEPATICA", "EMBARAZO", "TIPO_PACIENTE", "RESULTADO_PCR"]
-    excluidas = ["DICTAMEN", "ENFERMEDAD_ULC_PEPTICA", "HABLA_LENGUA_INDIG", "TOMA_MUESTRA",
+                 "CIRROSIS_HEPATICA", "EMBARAZO", "TIPO_PACIENTE", "RESULTADO_PCR"],
+                "No entran al modelo (18)",
+                ["DICTAMEN", "ENFERMEDAD_ULC_PEPTICA", "HABLA_LENGUA_INDIG", "TOMA_MUESTRA",
                  "ENTIDAD_RES", "MUNICIPIO_RES", "ENTIDAD_UM_NOTIF", "MUNICIPIO_UM_NOTIF",
                  "MUNICIPIO_ASIG", "INSTITUCION_UM_NOTIF", "FECHA_ACTUALIZACION", "ARCHIVO_FUENTE",
                  "FECHA_ARCHIVO", "N_FOTOS", "PRIMERA_FOTO", "ULTIMA_FOTO",
-                 "DEFUNCION_CAMBIO", "EN_FOTO_FINAL"]
-
-    def lista(x, titulo, color_titulo, items, bullet_color, fill, line):
-        tarjeta(s, x, 1.85, 5.9, 4.95, fill=fill, line=line)
-        texto(s, x + 0.3, 2.05, 5.3, 0.3, titulo, size=12, bold=True, color=color_titulo)
-        mitad = (len(items) + 1) // 2
-        for c, grupo in enumerate([items[:mitad], items[mitad:]]):
-            texto(s, x + 0.3 + c * 2.75, 2.5, 2.7, 4.2,
-                  [{"text": v, "bullet": True, "bullet_color": bullet_color, "after": 5} for v in grupo],
-                  size=13)
-
-    lista(0.6, f"SE CONSERVAN ({len(conservan)})", TEAL, conservan, TEAL, MIST, None)
-    lista(6.8, f"NO ENTRAN AL MODELO ({len(excluidas)})", MUTED, excluidas, MUTED, PAPER, LINE)
-    notas(s, "Pasamos de 35 a 17 columnas. Lo más importante es lo que dejamos fuera a propósito: "
-             "DICTAMEN es consecuencia de la muerte, no una causa, así que incluirlo haría trampa al modelo.")
+                 "DEFUNCION_CAMBIO", "EN_FOTO_FINAL"],
+                "DICTAMEN se excluye por fuga de información: solo se asigna a quienes murieron "
+                "(250,135 de 250,138 vivos tienen 'No aplica'). Tampoco se calcula el conteo de "
+                "muertos por año, porque se derivaría del mismo DEFUNCION.",
+                size=13, columnas=2)
 
 
 def slide_recodificacion(prs):
-    s = titulo_contenido(prs, "02 · Limpieza", "Recodificamos las variables a 1/0 para la regresión logística")
-    texto(s, 0.6, 1.85, 5.6, 0.35, "Reglas de recodificación", size=14, bold=True, color=INK)
-    reglas = [
-        ("Catálogo Sí/No", "1 = Sí, 2 = No  →  1 = Sí, 0 = No"),
-        ("SEXO → HOMBRE", "1 = hombre, 0 = mujer"),
-        ("TIPO_PACIENTE → HOSPITALIZADO", "1 = hospitalizado; 9 vacíos se asignan a ambulatorio (0)"),
-        ("ENTIDAD_ASIG → COSTERA", "1 = una de las 17 entidades con costa"),
-    ]
-    for i, (t, d) in enumerate(reglas):
-        y = 2.3 + i * 0.95
-        tarjeta(s, 0.6, y, 5.6, 0.82, fill=MIST)
-        texto(s, 0.85, y + 0.1, 5.1, 0.35, t, size=14, bold=True, color=INK)
-        texto(s, 0.85, y + 0.43, 5.1, 0.35, d, size=13, color=TEXT)
-    texto(s, 0.6, 6.2, 5.6, 0.5, "Ninguna variable tiene valores fuera de {1, 2}: no se quita ninguna fila.",
-          size=13, color=MUTED)
-
-    texto(s, 6.7, 1.85, 6.0, 0.35, "Proporción de pacientes con cada condición", size=14, bold=True, color=INK)
-    for i, (num, lab) in enumerate([("70.1%", "costera"), ("44.8%", "hombres"), ("38.9%", "hospitalizados")]):
-        stat(s, 6.7 + i * 2.05, 2.25, 2.0, num, lab, color=TEAL, size=28)
-    grafica_barras(s, 6.6, 3.45, 6.1, 3.35,
-                   ["Indígena", "Diabetes", "Embarazo*", "Hipertensión", "Hemorrágicos",
-                    "Enf. renal", "Inmunosupresión", "Cirrosis"],
-                   [0.03314, 0.02879, 0.02621, 0.02349, 0.00908, 0.00251, 0.00147, 0.00093],
-                   TEAL, formato="0.00%", horizontal=True, label_size=11, cat_size=12, gap=40, max_val=0.042)
-    texto(s, 6.7, 6.8, 6.0, 0.25, "* Embarazo vale 0 en todos los hombres.", size=10, color=MUTED)
-    notas(s, "El modelo necesita variables 0/1, pero el catálogo oficial usa 1 = Sí y 2 = No. "
-             "Las comorbilidades son poco frecuentes: la más común, ser indígena, es apenas 3.3%. "
-             "Esto importa para la estabilidad de los coeficientes.")
+    texto_y_grafica(prs, "Recodificación a 1/0", [
+        "**Catálogo Sí/No:** 1 = Sí, 2 = No → 1 = Sí, 0 = No",
+        "**SEXO → HOMBRE:** 1 = hombre (44.8%)",
+        "**TIPO_PACIENTE → HOSPITALIZADO:** 1 = hospitalizado (38.9%); 9 vacíos → ambulatorio",
+        "**ENTIDAD_ASIG → COSTERA:** 1 = una de las 17 entidades con costa (70.1%)",
+        "No se quita ninguna fila",
+    ], ["Indígena", "Diabetes", "Embarazo", "Hipertensión", "Hemorrágicos",
+        "Enf. renal", "Inmunosupresión", "Cirrosis"],
+        [0.03314, 0.02879, 0.02621, 0.02349, 0.00908, 0.00251, 0.00147, 0.00093], "0.00%",
+        "Gráfica: proporción de pacientes con cada condición. Las comorbilidades son poco frecuentes; "
+        "la más común, ser indígena, es apenas 3.3%. Embarazo vale 0 en todos los hombres.",
+        horizontal=True, size=18)
 
 
 def slide_serotipo(prs):
-    s = titulo_contenido(prs, "02 · Limpieza · Variables dummy",
-                         "Serotipo: DENV1 es la referencia y tiene la menor mortalidad")
-    texto(s, 0.6, 1.85, 6.8, 0.35, "Mortalidad por serotipo (resultado de PCR)", size=14, bold=True, color=INK)
-    grafica_barras(s, 0.5, 2.25, 7.0, 4.0,
-                   ["DENV1\n13,531", "DENV2\n23,139", "DENV3\n71,812", "DENV4\n1,396", "Sin serotipo\n142,022"],
-                   [0.0029, 0.0066, 0.0067, 0.0086, 0.0076], [AMBER, RED, RED, RED, RED],
-                   formato="0.00%", label_size=14, cat_size=12, max_val=0.0105)
-    texto(s, 0.6, 6.3, 6.8, 0.3, "Debajo de cada barra: número de casos confirmados.", size=11, color=MUTED)
-
-    texto(s, 7.9, 1.85, 4.8, 4.8, [
-        {"runs": [("5 categorías → 4 dummies ", {"bold": True, "color": INK}),
-                  ("(DENV2, DENV3, DENV4, SIN_SEROTIPO).", {})], "after": 6},
-        {"text": "Incluir las 5 columnas las haría colineales con el intercepto (trampa de las dummies).",
-         "size": 14, "color": MUTED, "after": 18},
-        {"runs": [("DENV1 es la referencia: ", {"bold": True, "color": AMBER_TXT}),
-                  ("cada coeficiente se lee comparado con DENV1.", {})], "after": 18},
-        {"runs": [("\"Sin serotipo\" es el 56.4% de los confirmados. ", {"bold": True, "color": INK}),
-                  ("Es un serotipo desconocido, no un quinto virus.", {})], "after": 6},
-        {"text": "Causas: confirmación por NS1 o IgM, muestra tomada tarde (más de ~5 días) "
-                 "o confirmación por asociación epidemiológica.", "size": 14, "color": MUTED},
-    ], size=15)
-    notas(s, "El resultado de PCR tiene cinco categorías, así que creamos cuatro variables dummy y "
-             "dejamos DENV1 como referencia. Más de la mitad de los confirmados no tienen serotipo "
-             "identificado, pero siguen siendo casos de dengue confirmados.")
+    texto_y_grafica(prs, "Serotipo (RESULTADO_PCR) → variables dummy", [
+        "5 categorías → 4 dummies: DENV2, DENV3, DENV4, SIN_SEROTIPO",
+        "**DENV1 es la referencia** (menor mortalidad: 0.29%)",
+        "Incluir las 5 columnas causaría colinealidad con el intercepto",
+        "**Sin serotipo** (56.4% de los confirmados) es un serotipo desconocido, no un quinto virus",
+    ], ["DENV1", "DENV2", "DENV3", "DENV4", "Sin serotipo"],
+        [0.0029, 0.0066, 0.0067, 0.0086, 0.0076], "0.00%",
+        "Gráfica: mortalidad por serotipo. Casos: DENV1 13,531; DENV2 23,139; DENV3 71,812; DENV4 1,396; "
+        "sin serotipo 142,022. Sin serotipo se debe a confirmación por NS1 o IgM, muestra tomada tarde "
+        "o confirmación por asociación epidemiológica.",
+        grafica_izq=True, size=18)
 
 
 def slide_mes(prs):
-    s = titulo_contenido(prs, "02 · Limpieza · Variables dummy",
-                         "El mes de síntomas controla la estacionalidad")
-    texto(s, 0.6, 1.85, 7.4, 0.35, "Porcentaje de casos confirmados por mes", size=14, bold=True, color=INK)
-    meses = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
-    casos = [0.036, 0.022, 0.020, 0.020, 0.028, 0.052, 0.080, 0.158, 0.211, 0.217, 0.133, 0.024]
-    col = ["9CC7BD"] * 5 + [TEAL] * 4 + [AMBER] + ["9CC7BD"] * 2
-    grafica_barras(s, 0.5, 2.25, 7.5, 3.9, meses, casos, col, formato="0%", label_size=11, cat_size=12, gap=40)
-    texto(s, 0.6, 6.2, 7.4, 0.5,
-          [{"runs": [("Lluvias (jun–oct) ", {"bold": True, "color": TEAL}), ("concentran el 72% de los casos. ", {}),
-                     ("Octubre ", {"bold": True, "color": AMBER_TXT}), ("es la referencia.", {})]}],
-          size=13, color=MUTED)
-
-    tarjeta(s, 8.4, 1.85, 4.3, 2.35, fill=MIST)
-    texto(s, 8.7, 2.05, 3.8, 0.3, "MORTALIDAD", size=12, bold=True, color=RED)
-    stat(s, 8.7, 2.4, 1.9, "0.68%", "en lluvias", color=RED, size=28)
-    stat(s, 10.7, 2.4, 1.9, "0.76%", "en secas", color=RED, size=28)
-    texto(s, 8.7, 3.6, 3.8, 0.5, "En temporada alta se confirman muchos casos leves.", size=12, color=TEXT)
-
-    tarjeta(s, 8.4, 4.4, 4.3, 2.3, fill=MIST)
-    texto(s, 8.7, 4.6, 3.8, 0.3, "HOSPITALIZACIÓN", size=12, bold=True, color=TEAL)
-    stat(s, 8.7, 4.95, 3.8, "~48%", "en enero–marzo, contra ~37% en temporada alta", color=TEAL, size=28)
-    notas(s, "El mes de inicio de síntomas entra como 11 dummies con octubre como referencia, por ser "
-             "el mes con más casos (21.7%) y dar coeficientes más estables. En secas se estudian sobre "
-             "todo los casos graves, por eso la mortalidad y la hospitalización son más altas: el mes "
-             "capta ese cambio en el perfil de los casos.")
+    texto_y_grafica(prs, "Mes de inicio de síntomas → variables dummy", [
+        "11 dummies; **octubre es la referencia** (mes con más casos, 21.7%)",
+        "Lluvias (jun–oct) concentran el 72% de los casos",
+        "Mortalidad: 0.68% en lluvias vs 0.76% en secas",
+        "Hospitalización: ~48% en enero–marzo",
+    ], ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"],
+        [0.036, 0.022, 0.020, 0.020, 0.028, 0.052, 0.080, 0.158, 0.211, 0.217, 0.133, 0.024], "0%",
+        "Gráfica: porcentaje de casos confirmados por mes. En secas se estudian sobre todo los casos "
+        "graves; el mes capta ese cambio en el perfil de los casos.",
+        grafica_izq=True, size=18)
 
 
 def slide_anio(prs):
-    s = titulo_contenido(prs, "02 · Limpieza · Decisión del equipo",
-                         "El año se excluye: su mortalidad no muestra tendencia")
-    texto(s, 0.6, 1.85, 7.4, 0.35, "Mortalidad de casos confirmados por año", size=14, bold=True, color=INK)
-    grafica_barras(s, 0.5, 2.25, 7.5, 4.0,
-                   ["2020\n24,308", "2021\n6,553", "2022\n12,327", "2023\n54,197",
-                    "2024\n123,141", "2025\n21,918", "2026\n9,456"],
-                   [0.0058, 0.0076, 0.0066, 0.0073, 0.0069, 0.0086, 0.0058], RED,
-                   formato="0.00%", label_size=13, cat_size=12, max_val=0.0105)
-    texto(s, 0.6, 6.3, 7.4, 0.3, "Debajo de cada barra: número de casos confirmados.", size=11, color=MUTED)
-
-    texto(s, 8.4, 1.85, 4.3, 0.35, "Por qué se excluye", size=14, bold=True, color=INK)
-    texto(s, 8.4, 2.3, 4.3, 2.0, [
-        {"text": "La mortalidad oscila entre 0.58% y 0.86% sin una dirección clara.", "bullet": True, "after": 10},
-        {"text": "Los avances médicos entre años no implican necesariamente menos muertes.", "bullet": True},
-    ], size=15)
-    tarjeta(s, 8.4, 4.45, 4.3, 1.85, fill="FBF1DE")
-    texto(s, 8.7, 4.65, 3.8, 0.3, "LIMITACIÓN", size=12, bold=True, color=AMBER_TXT)
-    texto(s, 8.7, 5.0, 3.8, 1.2,
-          "El serotipo dominante cambió con los años (DENV2 en 2020–2021, DENV3 desde 2023): "
-          "sin el año, el serotipo absorbe parte del efecto de la época.", size=13, color=TEXT)
-    notas(s, "Decidimos no incluir el año. Lo dejamos explícito como limitación porque el serotipo "
-             "dominante cambió con el tiempo.")
+    texto_y_grafica(prs, "El año se excluye del modelo", [
+        "La mortalidad oscila entre 0.58% y 0.86% sin tendencia clara",
+        "Los avances médicos entre años no implican necesariamente menos muertes",
+        "**Limitación:** el serotipo dominante cambió (DENV2 en 2020–2021, DENV3 desde 2023); "
+        "sin el año, el serotipo absorbe parte del efecto de la época",
+    ], ["2020", "2021", "2022", "2023", "2024", "2025", "2026"],
+        [0.0058, 0.0076, 0.0066, 0.0073, 0.0069, 0.0086, 0.0058], "0.00%",
+        "Gráfica: mortalidad de casos confirmados por año. Confirmados: 2020 24,308; 2021 6,553; "
+        "2022 12,327; 2023 54,197; 2024 123,141; 2025 21,918; 2026 9,456.",
+        grafica_izq=True, size=18)
 
 
 def slide_base_final(prs):
-    s = titulo_contenido(prs, "02 · Limpieza · Resultado", "La base final queda lista para modelar")
-    stats = [("251,900", "pacientes confirmados", TEAL), ("29", "columnas", TEAL),
-             ("1,763", "muertes (0.70%)", RED), ("0", "valores faltantes", TEAL)]
-    for i, (n, l, c) in enumerate(stats):
-        x = 0.6 + i * 3.1
-        tarjeta(s, x, 1.85, 2.8, 1.55, fill=MIST)
-        stat(s, x + 0.3, 2.0, 2.3, n, l, color=c, size=32)
+    contenido(prs, "Base final", [
+        "**251,900 pacientes × 29 columnas**, sin valores faltantes (dengue_limpio.csv)",
+        "**1,763 muertes (0.70%)**",
+        "Columnas:",
+        ("ID_REGISTRO y DEFUNCION (objetivo)", 1),
+        ("EDAD_ANOS: media 28.5, mediana 25, rango 0–112", 1),
+        ("11 binarias: HOMBRE, COSTERA, INDIGENA, HEMORRAGICOS, comorbilidades, HOSPITALIZADO", 1),
+        ("4 de serotipo (ref. DENV1) y 11 de mes (ref. octubre)", 1),
+        "**Para el modelo:** clases muy desbalanceadas; la exactitud por sí sola engaña",
+    ], "Con 0.7% de muertes, un modelo que dijera 'nadie muere' tendría 99.3% de exactitud.")
 
-    texto(s, 0.6, 3.75, 7.0, 0.35, "Composición de las 29 columnas", size=14, bold=True, color=INK)
-    grupos = [("1", "Identificador", "ID_REGISTRO"), ("1", "Objetivo", "DEFUNCION"),
-              ("1", "Numérica", "EDAD_ANOS (media 28.5, mediana 25, rango 0–112)"),
-              ("11", "Binarias", "HOMBRE, COSTERA, INDIGENA, HEMORRAGICOS, comorbilidades, HOSPITALIZADO"),
-              ("4", "Serotipo", "DENV2, DENV3, DENV4, SIN_SEROTIPO (ref. DENV1)"),
-              ("11", "Mes", "MES_ENE … MES_DIC (ref. octubre)")]
-    for i, (n, g, d) in enumerate(grupos):
-        y = 4.2 + i * 0.44
-        texto(s, 0.6, y, 0.55, 0.4, n, size=16, bold=True, color=TEAL, align=PP_ALIGN.RIGHT)
-        texto(s, 1.35, y, 1.6, 0.4, g, size=14, bold=True, color=INK)
-        texto(s, 3.0, y, 5.0, 0.4, d, size=13, color=TEXT)
 
-    tarjeta(s, 8.4, 3.75, 4.3, 2.95, fill="F9E9EC")
-    texto(s, 8.7, 3.95, 3.8, 0.3, "PARA EL MODELO", size=12, bold=True, color=RED)
-    texto(s, 8.7, 4.35, 3.8, 2.3, [
-        {"runs": [("Clases muy desbalanceadas: ", {"bold": True}), ("solo 7 de cada 1,000 pacientes murieron.", {})],
-         "after": 10},
-        {"text": "Hay que tenerlo en cuenta al evaluar el modelo: la exactitud por sí sola engaña.", "color": MUTED},
-    ], size=14)
-    notas(s, "Resultado: dengue_limpio.csv, 251,900 filas por 29 columnas, sin faltantes. "
-             "El punto clave para la siguiente etapa es el desbalance: con 0.7% de muertes, un modelo "
-             "que dijera 'nadie muere' tendría 99.3% de exactitud.")
+# ───────────────────────── 03 · EDA ─────────────────────────
+def slide_div_eda(prs):
+    seccion(prs, "03 · Análisis exploratorio", "Qué variables se asocian a la muerte antes de ajustar el modelo",
+            "Tercera etapa: notebook 03_EDA.ipynb.")
+
+
+def slide_desbalance(prs):
+    contenido(prs, "Variable objetivo: clases muy desbalanceadas", [
+        "**250,137 sobrevivieron y 1,763 fallecieron:** mortalidad de 0.70% (1 de cada 142)",
+        "Consecuencias para el modelo:",
+        ("La exactitud engaña: predecir \"nadie fallece\" acierta más del 99%", 1),
+        ("Con umbral de 0.5 casi no se detectaría a ningún fallecido", 1),
+        ("Hay que revisar recall, precision, F1 y la curva ROC", 1),
+        ("Estratificar por DEFUNCION al dividir en entrenamiento y prueba", 1),
+    ], "La base tiene 251,900 casos confirmados, sin faltantes ni IDs duplicados.")
+
+
+def slide_edad(prs):
+    s = nueva(prs, L_SOLO_TITULO, "Edad: los fallecidos son 11 años mayores en promedio",
+              "La distribución general tiene asimetría positiva (cola larga de adultos mayores). "
+              "En los fallecidos es casi simétrica y aplanada: hay muertes en todas las edades, "
+              "con mucho más peso en adultos mayores.")
+    filas = [
+        ("Medida", "Todos", "Sobrevivió (0)", "Falleció (1)"),
+        ("Media", "28.5", "28.4", "39.4"),
+        ("Mediana", "25", "25", "37"),
+        ("Moda", "13", "13", "10"),
+        ("Desviación estándar", "17.8", "17.7", "25.1"),
+        ("Q1 – Q3", "14 – 40", "14 – 40", "16 – 59.5"),
+        ("Rango intercuartílico", "26", "26", "43.5"),
+        ("Asimetría", "0.79", "0.79", "0.25"),
+        ("Curtosis", "0.03", "0.03", "-1.09"),
+    ]
+    a_tabla(s, filas, Inches(0.67), Inches(1.8), Inches(12), anchos=[4, 2.6, 2.7, 2.7], size=18)
+
+
+def slide_grupo_edad(prs):
+    texto_y_grafica(prs, "Mortalidad por grupo de edad: forma de \"U\"", [
+        "Alta en menores de 5 años (1.17%)",
+        "Mínima entre 15 y 19 años (0.33%)",
+        "Crece desde los 40 años hasta **7.09% en mayores de 80**",
+        "El log-odds no es una línea recta → **la relación con la edad no es lineal**",
+        "En el modelo se probará un término **edad²** (comparando AIC y BIC)",
+    ], ["0-4", "5-9", "10-14", "15-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+"],
+        [0.0117, 0.0067, 0.0047, 0.0033, 0.0042, 0.0053, 0.0072, 0.0100, 0.0157, 0.0339, 0.0709], "0.0%",
+        "La regresión logística supone una relación lineal entre cada variable y el log-odds. "
+        "Log-odds por grupo: de -4.43 (0-4) baja a -5.71 (15-19) y sube a -2.57 (80+).",
+        grafica_izq=True, size=18)
+
+
+def slide_binarias_eda(prs):
+    texto_y_grafica(prs, "Las comorbilidades son mucho más frecuentes en los fallecidos", [
+        "**Enfermedad renal:** 0.25% de todos los casos, 4.4% de los fallecidos (17 veces más)",
+        "Cirrosis 7.4×, inmunosupresión 6.2×, hemorrágicos 5.6×, diabetes 5.2×, hipertensión 4.7×",
+        "**96% de los fallecidos estuvo hospitalizado** (39% del total)",
+        "Sexo, indígena, embarazo, costera y serotipo: proporciones parecidas en ambos grupos",
+    ], ["Diabetes", "Hipertensión", "Hemorrágicos", "Enf. renal", "Indígena", "Embarazo",
+        "Inmunosupresión", "Cirrosis"],
+        {"Todos los casos": [0.0288, 0.0235, 0.0091, 0.0025, 0.0331, 0.0262, 0.0015, 0.0009],
+         "Fallecidos": [0.1492, 0.1100, 0.0505, 0.0437, 0.0391, 0.0289, 0.0091, 0.0068]}, "0.0%",
+        "Gráfica: porcentaje de pacientes con cada condición. Las variables más raras (cirrosis 233 casos, "
+        "inmunosupresión 371, DENV4 1,396) tienen pocos fallecidos: sus coeficientes pueden ser poco precisos.",
+        horizontal=True, size=18)
+
+
+def slide_or_crudo(prs):
+    s = nueva(prs, L_DOS, "Odds ratio crudo de cada condición",
+              "El OR crudo compara los odds de fallecer con y sin la condición, sin ajustar por las demás "
+              "variables. Puede cambiar en el modelo multivariado, porque las variables están relacionadas "
+              "(por ejemplo, la diabetes es más común en personas mayores).")
+    vinetas(ph(s, 1), [
+        "**Hospitalizado (OR ≈ 36):** 1.72% de mortalidad contra 0.05% en ambulatorios",
+        "**Enfermedad renal (OR ≈ 20.5):** 12.2% de mortalidad, la más alta",
+        "Cirrosis, inmunosupresión, diabetes, hemorrágicos e hipertensión: OR entre 5 y 8",
+        "Costera, serotipo, indígena, embarazo y sexo: OR cercano a 1 (asociación débil)",
+    ], size=18)
+    x, y, w, h = _quitar(s, 2)
+    a_tabla(s, [
+        ("Variable", "Mort. con", "Mort. sin", "OR"),
+        ("Hospitalizado", "1.72%", "0.05%", "36.45"),
+        ("Enf. renal", "12.16%", "0.67%", "20.50"),
+        ("Cirrosis", "5.15%", "0.70%", "7.75"),
+        ("Inmunosupresión", "4.31%", "0.69%", "6.44"),
+        ("Diabetes", "3.63%", "0.61%", "6.10"),
+        ("Hemorrágicos", "3.89%", "0.67%", "6.00"),
+        ("Hipertensión", "3.28%", "0.64%", "5.28"),
+        ("Costera", "0.76%", "0.56%", "1.36"),
+        ("DENV4", "0.86%", "0.70%", "1.23"),
+        ("Sin serotipo", "0.76%", "0.62%", "1.23"),
+        ("Indígena", "0.83%", "0.70%", "1.19"),
+        ("Embarazo", "0.77%", "0.70%", "1.11"),
+        ("Hombre", "0.72%", "0.68%", "1.06"),
+        ("DENV2", "0.66%", "0.70%", "0.94"),
+        ("DENV3", "0.67%", "0.71%", "0.94"),
+    ], x, y - Inches(0.15), w, anchos=[3, 2, 2, 1.5], size=12, alto_fila=0.3)
+
+
+def slide_serotipo_mes_eda(prs):
+    contenido(prs, "Serotipo y mes: asociaciones débiles", [
+        "**Serotipo:**",
+        ("56% de los casos no tiene serotipo identificado; DENV3 es el más común (28.5%)", 1),
+        ("DENV1 tiene la menor mortalidad (0.29%); los demás entre 0.66% y 0.86%", 1),
+        "**Mes de inicio de síntomas:**",
+        ("Los casos se concentran entre agosto y noviembre, con el máximo en octubre", 1),
+        ("Mortalidad algo mayor fuera de temporada (0.76%–1.01% en enero–junio) y ≈0.65% en los meses pico", 1),
+        ("En temporada alta se confirman muchos casos leves", 1),
+        "En ambos casos las diferencias son pequeñas en términos absolutos",
+    ], "Las gráficas de serotipo y mes ya se mostraron en la sección de limpieza.")
+
+
+def slide_correlacion(prs):
+    s = nueva(prs, L_DOS, "Correlación: sin problemas graves de multicolinealidad",
+              "Pearson y Spearman dan mapas casi idénticos porque casi todas las variables son binarias; "
+              "solo cambia la edad. Para dos variables 0/1, Pearson equivale al coeficiente phi.")
+    vinetas(ph(s, 1), [
+        "**Con DEFUNCION todas las correlaciones son bajas** (la mayor es 0.10, con HOSPITALIZADO)",
+        ("Es esperado con una variable objetivo tan desbalanceada", 1),
+        ("El orden coincide: hospitalización, enf. renal, diabetes, edad, hipertensión, hemorrágicos", 1),
+        "**Entre predictores** la correlación más alta es entre dummies de la misma variable (serotipo)",
+        "Diabetes, hipertensión y edad: correlación moderada con sentido clínico",
+    ], size=18)
+    x, y, w, h = _quitar(s, 2)
+    a_tabla(s, [
+        ("Par de predictores", "Correlación"),
+        ("DENV3 – SIN_SEROTIPO", "-0.718"),
+        ("DIABETES – HIPERTENSION", "0.367"),
+        ("DENV2 – SIN_SEROTIPO", "-0.362"),
+        ("EDAD_ANOS – DIABETES", "0.254"),
+        ("EDAD_ANOS – HIPERTENSION", "0.243"),
+        ("HEMORRAGICOS – DIABETES", "0.233"),
+    ], x, y, w, anchos=[3, 1.3], size=16)
+
+
+def slide_distribuciones(prs):
+    texto_y_grafica(prs, "Edad: ajuste de 11 distribuciones (MLE + Kolmogorov-Smirnov)", [
+        "Parámetros estimados por máxima verosimilitud; menor estadístico KS = mejor ajuste",
+        "**La mejor es la gamma** (KS = 0.043), seguida de chi-cuadrada, beta y Weibull",
+        "**Todos los p-values son 0:** se rechazan las 11 distribuciones",
+        ("Con más de 250 mil datos, KS detecta diferencias muy pequeñas", 1),
+        ("La edad está en años enteros; las distribuciones son continuas", 1),
+    ], ["Gamma", "Chi-cuadrada", "Beta", "Weibull", "Logística", "Normal", "Triangular",
+        "Exponencial", "Poisson", "Uniforme", "Log-normal"],
+        [0.0430, 0.0430, 0.0452, 0.0467, 0.0779, 0.0950, 0.1682, 0.1840, 0.3484, 0.4194, 0.5060], "0.000",
+        "Gráfica: estadístico KS de cada distribución (menor es mejor). La log-normal falla porque hay "
+        "pacientes de 0 años; la Poisson porque supone media = varianza (28.5 vs 317).",
+        horizontal=True, size=18)
+
+
+def slide_kde(prs):
+    imagen_y_texto(prs, "Edad: la KDE describe mejor los datos", "03_EDA.ipynb", "KDE de la edad por desenlace", [
+        "En una muestra de 5,000 pacientes, KS de la KDE = 0.027 contra 0.036 de la gamma",
+        "Sobrevivientes: concentrados entre 10 y 30 años. Fallecidos: densidad plana con mucha masa entre 50 y 90",
+        "Desde los ~43 años la densidad de los fallecidos supera a la de los sobrevivientes",
+    ], "KDE con kernel gaussiano y ancho de banda de Silverman (factor 0.088).")
+
+
+def slide_conclusiones_eda(prs):
+    contenido(prs, "Conclusiones del EDA", [
+        "**Datos:** 251,900 casos confirmados, sin faltantes ni duplicados",
+        "**Desbalance:** 0.70% de muertes; estratificar y no usar la exactitud como métrica",
+        "**Edad:** relación en forma de \"U\" y no lineal con el log-odds → probar edad²",
+        "**Distribución de la edad:** gamma es la mejor paramétrica, pero KS la rechaza; la KDE ajusta mejor",
+        "**Factores más asociados:** hospitalización, enf. renal, cirrosis, inmunosupresión, diabetes, "
+        "hemorrágicos e hipertensión",
+        "**Hospitalización** (96% de los fallecidos) refleja la gravedad más que causar la muerte: "
+        "se analizará incluirla y excluirla",
+        "**Multicolinealidad:** solo entre dummies de serotipo, lo cual es esperado",
+    ], size=18)
+
+
+# ───────────────────────── 04 · Modelo ─────────────────────────
+def slide_div_modelo(prs):
+    seccion(prs, "04 · Modelo de regresión logística",
+            "Probabilidad de fallecer y odds ratio de cada variable",
+            "Cuarta etapa: notebook 04_modelo.ipynb. p = 1 / (1 + e^-(β0 + β1·x1 + … + βk·xk)); "
+            "el efecto de cada variable se interpreta con su odds ratio e^β.")
+
+
+def slide_decisiones_eda(prs):
+    s = nueva(prs, L_SOLO_TITULO, "Decisiones del modelo que vienen del EDA")
+    a_tabla(s, [
+        ("Hallazgo del EDA", "Decisión en el modelo"),
+        ("Solo 0.70% de fallecidos", "Undersampling 75/25 y partición estratificada; evaluar con recall, "
+                                     "precision, F1 y ROC-AUC"),
+        ("La edad no es lineal en el log-odds (forma de \"U\")", "Agregar el término edad² (EDAD_ANOS_2)"),
+        ("HOSPITALIZADO refleja la gravedad del paciente", "Comparar el modelo final con y sin esta variable"),
+        ("Muchas variables con asociación débil", "Backward selection con p-value, AIC y BIC"),
+    ], Inches(0.67), Inches(1.9), Inches(12), anchos=[5, 7], size=18, alto_fila=0.7)
+
+
+def slide_edad_logodds(prs):
+    imagen_y_texto(prs, "La edad entra como parábola en el log-odds", "04_modelo.ipynb", "Log-odds empírico (tamaño", [
+        "**Lineal:** AIC 20,427.7 · **Con edad²:** AIC 20,139.9 (≈290 menos)",
+        "β₁ = −0.036 y β₂ = 0.00076: forma de \"U\" con mínimo cerca de los 24 años",
+        "La recta subestima el riesgo de niños y adultos mayores, y lo sobreestima entre 20 y 50 años",
+    ], "Ajustes univariados (solo edad) con todos los datos, antes del undersampling. Los puntos son el "
+       "log-odds empírico por intervalos de 5 años. Referencia: log-odds de −4.6 ≈ 1% de mortalidad, "
+       "−2.2 ≈ 10%, 0 = 50%. El modelo sigue siendo lineal en los parámetros.", ancho=11)
+
+
+def slide_undersampling(prs):
+    s = nueva(prs, L_DOS, "Undersampling: 75% sobrevivientes / 25% fallecidos",
+              "Los odds ratios no cambian porque el muestreo depende solo del desenlace. El intercepto sí: "
+              "se corrige con β0_real = β0 − ln[(0.25/0.75) / (π/(1−π))]. El conjunto de prueba también queda "
+              "con 25% de fallecidos, así que precision, F1 y accuracy no reflejan la proporción real.")
+    vinetas(ph(s, 1), [
+        "Se conservan **todos los fallecidos** y se toman al azar 3 sobrevivientes por cada uno",
+        "Solo se usa el **2% de los sobrevivientes**",
+        "Los OR no cambian; el intercepto sí → hay que corregir las probabilidades",
+        "La edad conserva su distribución dentro de cada clase",
+    ], size=18)
+    x, y, w, h = _quitar(s, 2)
+    a_tabla(s, [
+        ("", "Original", "Undersampling"),
+        ("Casos", "251,900", "7,052"),
+        ("Fallecidos", "1,763", "1,763"),
+        ("Sobrevivientes", "250,137", "5,289"),
+        ("Mortalidad", "0.70%", "25.0%"),
+    ], x, y, w, anchos=[2.2, 1.8, 2], size=18)
+
+
+def slide_modelo_completo(prs):
+    contenido(prs, "Partición y modelo completo", [
+        "**Partición 70/30 estratificada por DEFUNCION:** entrenamiento 4,936 (1,234 fallecidos) y "
+        "prueba 2,116 (529); ambos con 25%",
+        "**Modelo completo con 28 variables** (statsmodels, sobre entrenamiento):",
+        ("Log-verosimilitud −1,869.8 contra −2,775.7 del modelo nulo; LLR p-value ≈ 0", 1),
+        ("Pseudo R² = 0.326 (no comparable con un modelo sobre los datos originales)", 1),
+        ("Significativas: edad y edad², hemorrágicos, diabetes, enf. renal, hospitalización, DENV4 e indígena", 1),
+        ("No significativas: sexo, costera, hipertensión, inmunosupresión, cirrosis, embarazo, "
+         "demás serotipos y todos los meses", 1),
+    ], "El conjunto de prueba no se usa ni en el ajuste ni en la selección de variables; solo al final.")
+
+
+def slide_backward(prs):
+    s = nueva(prs, L_DOS, "Backward selection: de 28 a 7 variables",
+              "Se eliminaron los 11 meses, costera, cirrosis, sexo, DENV2, embarazo, sin serotipo, DENV3, "
+              "hipertensión, inmunosupresión e indígena. Con undersampling se pierde potencia: cirrosis, "
+              "inmunosupresión y algunos meses eran significativos con todos los datos.")
+    vinetas(ph(s, 1), [
+        "En cada paso se elimina la variable con mayor p-value mientras sea > 0.05",
+        "**El BIC baja en todos los pasos** (3,986 → 3,833)",
+        "El AIC tiene su mínimo con 12 variables (3,776.6); el modelo final queda 3.9 arriba",
+        "**Final:** edad, edad², hemorrágicos, diabetes, enf. renal, hospitalización y DENV4",
+        "Sin edad² el AIC sube 57 y el BIC 51 → se confirma la \"U\"",
+    ], size=17)
+    a_grafica_lineas(s, 2, [str(n) for n in range(28, 6, -1)], {
+        "AIC": [3797.650, 3795.655, 3793.696, 3791.742, 3789.968, 3788.103, 3786.405, 3784.735, 3783.191,
+                3781.981, 3780.870, 3779.961, 3779.180, 3778.604, 3778.394, 3776.640, 3776.626, 3776.636,
+                3777.317, 3777.870, 3778.823, 3780.571],
+        "BIC": [3986.275, 3977.776, 3969.312, 3960.854, 3952.576, 3944.207, 3936.004, 3927.830, 3919.782,
+                3912.068, 3904.452, 3897.038, 3889.753, 3882.673, 3875.959, 3867.701, 3861.182, 3854.688,
+                3848.864, 3842.913, 3837.362, 3832.606],
+    }, minimo=3750)
+
+
+def slide_modelo_final(prs):
+    s = nueva(prs, L_SOLO_TITULO, "Modelo final",
+              "Pseudo R² = 0.322, log-verosimilitud −1,882.3, LLR p-value ≈ 0. El intercepto está en la escala "
+              "de la muestra (25% de fallecidos); corregido a la mortalidad real es −7.670.")
+    a_tabla(s, [
+        ("Variable", "Coeficiente (β)", "Odds ratio (e^β)", "IC 95% del OR", "p-value"),
+        ("Hospitalizado", "3.516", "33.66", "25.24 – 44.90", "< 0.001"),
+        ("DENV4", "1.616", "5.03", "1.61 – 15.67", "0.005"),
+        ("Enfermedad renal", "1.236", "3.44", "1.71 – 6.91", "< 0.001"),
+        ("Hemorrágicos", "1.127", "3.09", "1.73 – 5.51", "< 0.001"),
+        ("Diabetes", "0.677", "1.97", "1.39 – 2.78", "< 0.001"),
+        ("Edad²", "0.0007", "1.0007", "1.0005 – 1.0008", "< 0.001"),
+        ("Edad", "−0.031", "0.970", "0.956 – 0.983", "< 0.001"),
+        ("Intercepto", "−3.814", "–", "–", "< 0.001"),
+    ], Inches(0.67), Inches(1.9), Inches(12), anchos=[3, 2.2, 2.3, 2.6, 1.6], size=18, alto_fila=0.48)
+
+
+def slide_or_final(prs):
+    texto_y_grafica(prs, "Interpretación de los odds ratios", [
+        "**Hospitalizado:** odds de fallecer 34 veces los de un ambulatorio",
+        "Enf. renal ×3.4, hemorrágicos ×3.1, diabetes ×2.0",
+        "Ningún intervalo de confianza incluye al 1",
+        "**DENV4 (×5.0) no es confiable:** solo 31 pacientes en entrenamiento (11 fallecidos) e IC de 1.6 a 15.7",
+        "Los OR son válidos con undersampling y parecidos al modelo con todos los datos",
+    ], ["Hospitalizado", "DENV4", "Enf. renal", "Hemorrágicos", "Diabetes"],
+        [33.66, 5.03, 3.44, 3.09, 1.97], "0.0",
+        "Los OR se interpretan manteniendo constantes las demás variables. Modelo sin undersampling: "
+        "hospitalización 31.4, enf. renal 4.2, diabetes 1.7. En los datos completos la mortalidad con DENV4 "
+        "es 0.86%, casi igual a la general, y sin undersampling no era significativo.",
+        horizontal=True, size=17)
+
+
+def slide_efecto_edad(prs):
+    s = nueva(prs, L_DOS, "Efecto de la edad en la probabilidad de fallecer",
+              "Paciente de referencia: sin comorbilidades, sin hemorragia y con serotipo distinto de DENV4. "
+              "Sin la corrección del intercepto, un hospitalizado de 85 años tendría ≈87%, porque el modelo "
+              "calcula probabilidades para una población donde 1 de cada 4 fallece.")
+    vinetas(ph(s, 1), [
+        "Edad y edad² no se interpretan por separado: juntas forman la \"U\"",
+        "Se corrige el intercepto (−3.81 → −7.67) para volver a la mortalidad real de 0.70%",
+        "El riesgo mínimo está alrededor de los **23 años**",
+        "Un hospitalizado de 85 años sin comorbilidades: **12.3%**",
+    ], size=18)
+    x, y, w, h = _quitar(s, 2)
+    a_tabla(s, [
+        ("Edad", "Ambulatorio", "Hospitalizado"),
+        ("0 años", "0.05%", "1.55%"),
+        ("20 años", "0.03%", "1.09%"),
+        ("60 años", "0.08%", "2.64%"),
+        ("85 años", "0.41%", "12.29%"),
+    ], x, y, w, anchos=[1.8, 2, 2], size=18)
+
+
+def slide_hospitalizado(prs):
+    s = nueva(prs, L_DOS, "¿Qué pasa si se quita HOSPITALIZADO?",
+              "La hospitalización no la causa la muerte, pero sí es consecuencia de la gravedad. Se conserva "
+              "porque se conoce desde la primera atención y mejora mucho el ajuste. El OR de 34 no significa "
+              "que hospitalizar cause la muerte: se hospitaliza a los pacientes más graves.")
+    vinetas(ph(s, 1), [
+        "Refleja la gravedad del paciente (posible endogeneidad)",
+        "**Sin ella el modelo empeora mucho:** ROC-AUC de 0.865 a 0.700",
+        "Las comorbilidades suben su OR: parte de su efecto ocurre a través de la hospitalización",
+        "DENV4 baja de 5.0 a 1.7: resultado frágil",
+        "**Decisión: se conserva.** Los demás OR se leen como efecto adicional a la hospitalización",
+    ], size=17)
+    x, y, w, h = _quitar(s, 2)
+    a_tabla(s, [
+        ("", "Con", "Sin"),
+        ("AIC", "3,781", "5,038"),
+        ("BIC", "3,833", "5,083"),
+        ("Pseudo R²", "0.322", "0.095"),
+        ("ROC-AUC (prueba)", "0.865", "0.700"),
+        ("OR enf. renal", "3.44", "6.56"),
+        ("OR diabetes", "1.97", "2.64"),
+        ("OR hemorrágicos", "3.09", "3.76"),
+        ("OR DENV4", "5.03", "1.65"),
+    ], x, y, w, anchos=[2.6, 1.5, 1.5], size=16)
+
+
+def slide_separabilidad(prs):
+    imagen_y_texto(prs, "Separabilidad de las probabilidades estimadas", "04_modelo.ipynb",
+                   "distribution_prob(y_test", [
+        "Sobrevivientes: mediana de 2.5%. Fallecidos: mediana de 40.5% (conjunto de prueba)",
+        "Dos grupos: ambulatorios (pico izquierdo) y hospitalizados (pico derecho)",
+        "Los sobrevivientes hospitalizados se traslapan con los fallecidos",
+    ], "Probabilidades sin corregir (escala de la muestra con 25% de fallecidos), eje en escala log. "
+       "En la población real serían menores, pero el orden de los pacientes es el mismo.", ancho=9)
+
+
+def slide_metricas(prs):
+    s = nueva(prs, L_DOS, "Métricas en prueba y curva ROC",
+              "El umbral de la curva ROC maximiza TPR − FPR (índice de Youden) y se calcula solo con "
+              "entrenamiento. En este problema un falso negativo es más costoso que un falso positivo, "
+              "por eso el recall es la métrica principal. Precision, F1 y accuracy dependen de la proporción "
+              "de 25% de fallecidos del conjunto de prueba. Nota: en el notebook, la celda de la sección 8.1 "
+              "usa umbral = 0.2; las cifras de 0.5 se verificaron reproduciendo el modelo.")
+    izq = ph(s, 1)
+    x, y, w = izq.left, izq.top, izq.width
+    a_tabla(s, [
+        ("Métrica (prueba)", "Umbral 0.5", "Umbral 0.143"),
+        ("Recall", "40.3%", "96.8%"),
+        ("Precision", "74.2%", "44.1%"),
+        ("F1", "0.522", "0.606"),
+        ("Accuracy", "81.6%", "68.5%"),
+        ("Fallecidos detectados", "213 de 529", "512 de 529"),
+    ], x, y, w, anchos=[2.6, 1.6, 1.7], size=15)
+    izq.top, izq.height = y + Inches(2.6), Inches(2.4)
+    vinetas(izq, [
+        "**ROC-AUC: 0.860 en entrenamiento y 0.865 en prueba** (buena discriminación, sin sobreajuste)",
+        "Con 0.5 se escapa el 60% de los fallecidos",
+        "El umbral de 0.143 sale de la curva ROC",
+    ], size=16)
+    xr, yr, wr, hr = _quitar(s, 2)
+    imagen_en(s, imagen_notebook("04_modelo.ipynb", "plt.title('Curva ROC')"), xr, yr, wr, hr)
+
+
+def slide_proporcion_real(prs):
+    s = nueva(prs, L_DOS, "Desempeño con la proporción real de fallecidos",
+              "Conjunto armado solo con pacientes que el modelo nunca vio: los 529 fallecidos de prueba y "
+              "sobrevivientes que quedaron fuera del undersampling, para llegar a 0.70%. Mismo umbral. "
+              "Con un evento tan raro, una precision baja es inevitable con cualquier umbral de recall alto.")
+    vinetas(ph(s, 1), [
+        "75,584 pacientes nunca vistos, con 0.70% de mortalidad (529 fallecidos)",
+        "Recall (96.8%) y ROC-AUC (0.865) no cambian",
+        "**La precision cae a 1.7%:** se marca como alto riesgo al 39.2% de los pacientes",
+        "**Un paciente de bajo riesgo sobrevive en el 99.96% de los casos**",
+        "Sirve para **descartar riesgo**, no para predecir con certeza quién morirá",
+    ], size=17)
+    x, y, w, h = _quitar(s, 2)
+    a_tabla(s, [
+        ("", "Pred. sobrevive", "Pred. fallece"),
+        ("Sobrevivió", "45,905", "29,150"),
+        ("Falleció", "17", "512"),
+    ], x, y, w, anchos=[1.8, 2.1, 2], size=18, alto_fila=0.6)
+
+
+def slide_conclusiones_modelo(prs):
+    contenido(prs, "Conclusiones del modelo", [
+        "**Buena discriminación:** ROC-AUC de 0.865, igual en entrenamiento y prueba",
+        "Con umbral de 0.143 detecta al 96.8% de los fallecidos; útil como herramienta de tamizaje",
+        "**Factores de riesgo:** hospitalización (OR 34), enf. renal (3.4), hemorrágicos (3.1), "
+        "diabetes (2.0) y edad en forma de \"U\"",
+        "**Sin efecto al ajustar:** sexo, embarazo, costera, hipertensión, demás serotipos y meses",
+        ("La hipertensión se explica por la edad y la diabetes, con las que está correlacionada", 1),
+        "**Undersampling:** no mejora la capacidad predictiva (AUC 0.865 contra 0.863)",
+        ("Mantiene los OR, pero pierde potencia estadística y obliga a corregir el intercepto", 1),
+    ], size=18)
+
+
+def slide_recomendaciones(prs):
+    contenido(prs, "Recomendaciones y mejoras futuras", [
+        "**Uso:** priorizar la vigilancia de hospitalizados, mayores de 60, menores de 5 y pacientes con "
+        "enf. renal, diabetes o hemorragias",
+        "**Estabilidad:** repetir el undersampling con distintas semillas (DENV4 probablemente no se repita)",
+        "**Desbalance:** comparar con pesos por clase o sobremuestreo, que no descartan información",
+        "**Más variables clínicas:** signos de alarma, plaquetas, hematocrito, días desde el inicio de síntomas",
+        "**Modelo solo con hospitalizados**, donde ocurren casi todas las muertes",
+        "**Calidad de los datos:** posible subregistro de comorbilidades; asociación no implica causalidad",
+    ], size=18)
 
 
 # ───────────────────────── Cierre ─────────────────────────
-def slide_siguientes(prs):
-    s = nueva(prs)
-    fondo(s, INK)
-    forma(s, MSO_SHAPE.OVAL, 9.2, 3.6, 5.6, 5.6, INK_2)
-    texto(s, 0.9, 0.9, 8, 0.4, "SIGUIENTES PASOS", size=12, bold=True, color=AMBER)
-    texto(s, 0.9, 1.35, 11, 1.0, "Con la base limpia, sigue explorar y modelar", size=40, bold=True,
-          color=PAPER, font=HEAD, nombre="Título")
-    pasos = [("03", "Análisis exploratorio", "Mortalidad por edad, comorbilidades, serotipo, mes y región."),
-             ("04", "Modelo de regresión logística", "Estimación, razones de momios e interpretación de coeficientes.")]
-    for i, (n, t, d) in enumerate(pasos):
-        y = 3.0 + i * 1.55
-        circulo_num(s, 0.9, y, 0.9, n, fill=AMBER, color=INK, size=20)
-        texto(s, 2.1, y - 0.02, 8, 0.5, t, size=22, bold=True, color=PAPER, font=HEAD)
-        texto(s, 2.1, y + 0.5, 8, 0.5, d, size=16, color=LIGHT_ON_DARK)
-    pie(s, prs, oscuro=True)
-    notas(s, "Estas dos etapas se agregarán en las siguientes secciones de la presentación.")
+def slide_insights(prs):
+    contenido(prs, "Hallazgos principales", [
+        "**1 de cada 142** pacientes con dengue confirmado fallece, pero el riesgo está muy concentrado: "
+        "el 39% de los pacientes (alto riesgo) reúne el 97% de las muertes",
+        "Un **hospitalizado de 85 años** sin comorbilidades tiene 12.3% de probabilidad de fallecer, "
+        "contra 1.1% a los 20 años",
+        "La **enfermedad renal** es la comorbilidad más peligrosa: 12.2% de mortalidad, 18 veces la de "
+        "quienes no la tienen",
+        "**Balancear las clases no mejora el modelo:** cambia la escala de las probabilidades y el umbral, "
+        "pero no la capacidad de distinguir a los pacientes en riesgo",
+    ])
 
 
 # ───────────────────────── Secciones ─────────────────────────
-# Para agregar EDA o modelo: añade aquí ("03 · EDA", [slide_div_eda, ...]) antes de "Siguientes pasos".
+# Para agregar EDA o modelo: añade aquí ("03 · EDA", [...]) antes de "Siguientes pasos".
 SECCIONES = [
     ("Introducción", [slide_portada, slide_ruta, slide_pregunta]),
     ("01 · Merge de datos", [slide_div_merge, slide_fuente, slide_estrategia, slide_trazabilidad,
                              slide_resultado_merge]),
     ("02 · Limpieza", [slide_div_limpieza, slide_embudo, slide_decision, slide_variables,
                        slide_recodificacion, slide_serotipo, slide_mes, slide_anio, slide_base_final]),
-    ("Siguientes pasos", [slide_siguientes]),
+    ("03 · Análisis exploratorio", [slide_div_eda, slide_desbalance, slide_edad, slide_grupo_edad,
+                                    slide_binarias_eda, slide_or_crudo, slide_serotipo_mes_eda,
+                                    slide_correlacion, slide_distribuciones, slide_kde,
+                                    slide_conclusiones_eda]),
+    ("04 · Modelo", [slide_div_modelo, slide_decisiones_eda, slide_edad_logodds, slide_undersampling,
+                     slide_modelo_completo, slide_backward, slide_modelo_final, slide_or_final,
+                     slide_efecto_edad, slide_hospitalizado, slide_separabilidad, slide_metricas,
+                     slide_proporcion_real, slide_conclusiones_modelo, slide_recomendaciones]),
+    ("Cierre", [slide_insights]),
 ]
 
 
@@ -717,7 +921,7 @@ def agregar_secciones(prs, secciones_ids):
 
 def main():
     prs = Presentation()
-    prs.slide_width, prs.slide_height = Inches(W), Inches(H)
+    a_16x9(prs)
     prs.core_properties.title = "Factores asociados a la defunción por dengue en México"
     secciones_ids = []
     for nombre, funciones in SECCIONES:
